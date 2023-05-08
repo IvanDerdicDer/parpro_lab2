@@ -82,6 +82,8 @@ class ConnectFourBoard:
                 return new_board
 
     def is_last_move_winning(self) -> bool:
+        # TODO[Ivan] Write the correct function. From last placed go in all directions.
+
         if self.last_token_placed is None:
             return False
 
