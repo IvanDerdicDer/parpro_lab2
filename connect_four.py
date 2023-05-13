@@ -1,8 +1,15 @@
+import math
 from dataclasses import dataclass, field
-from typing import Optional, Generator
+from functools import reduce
+from typing import Optional, Generator, Union
 from enum import Enum
 from copy import deepcopy
 from hashlib import md5
+from mpi4py import MPI
+import sys
+from concurrent.futures import ThreadPoolExecutor, Future
+from uuid import uuid4, UUID
+from queue import Queue
 
 
 class TokenEnum(Enum):
@@ -18,6 +25,14 @@ class ColumnFullException(Exception):
     pass
 
 
+class Shutdown:
+    pass
+
+
+class Request:
+    pass
+
+
 @dataclass
 class ConnectFourBoard:
     width: int
@@ -26,7 +41,7 @@ class ConnectFourBoard:
     is_column_full: Optional[list[bool]] = field(default=None)
     last_token_placed_position: Optional[tuple[int, int]] = field(default=None, init=False)
     last_token_placed: Optional[TokenEnum] = field(default=None, init=False)
-    weight: int = field(default=0, init=False)
+    weight: float = field(default=0, init=False)
     is_winning: bool = field(default=False, init=False)
 
     def __hash__(self):
@@ -55,7 +70,7 @@ class ConnectFourBoard:
         return f"ConnectFourBoard(width={self.width}, height={self.height}, board={self.board})"
 
     def drop_token(self, column: int, token: TokenEnum) -> "ConnectFourBoard":
-        new_board = ConnectFourBoard(self.width, self.height, deepcopy(self.board), self.is_column_full)
+        new_board = ConnectFourBoard(self.width, self.height, deepcopy(self.board), self.is_column_full.copy())
         # return new_board._inplace_drop_token(column, token)
 
         if new_board.is_column_full[column]:
@@ -209,29 +224,178 @@ def calculate_tree_weight(root: Node) -> Node:
     return root
 
 
+def calculate_tree_weight2(root: Node) -> Node:
+    if not root.children:
+        return root
+
+    for child in root.children:
+        calculate_tree_weight2(child)
+
+        root.value.weight += child.value.weight
+
+    root.value.weight /= len(root.children)
+
+    return root
+
+
 def print_tree(root: Node) -> None:
     stack = [root]
 
     while stack:
         top = stack.pop()
-        print("    " * top.depth + str(top.depth) + " " + str(top.value.__repr__()))
+        print("    " * top.depth + ' ' + str(top.value.weight))
 
         stack += top.children
 
 
-board = ConnectFourBoard(15, 15)
+def create_board() -> ConnectFourBoard:
+    board = ConnectFourBoard(7, 6)
 
-board = board.drop_token(0, TokenEnum.RED)
-board = board.drop_token(1, TokenEnum.YELLOW)
-board = board.drop_token(1, TokenEnum.RED)
-board = board.drop_token(2, TokenEnum.YELLOW)
-board = board.drop_token(2, TokenEnum.RED)
-board = board.drop_token(3, TokenEnum.YELLOW)
-board = board.drop_token(3, TokenEnum.RED)
+    board = board.drop_token(0, TokenEnum.RED)
+    board = board.drop_token(1, TokenEnum.YELLOW)
+    board = board.drop_token(1, TokenEnum.RED)
+    board = board.drop_token(2, TokenEnum.YELLOW)
+    board = board.drop_token(2, TokenEnum.RED)
+    board = board.drop_token(3, TokenEnum.YELLOW)
 
-root = Node(board)
-root = build_tree(root, 3)
-root = calculate_tree_weight(root)
-print(max(i.value.weight for i in root.children))
-print(*(i.value.weight for i in root.children))
-# print_tree(root)
+    return board
+
+
+def get_next_move(l: list[float]) -> int:
+    m = max(l)
+
+    return l.index(m)
+
+
+def calculate_on_worker(
+        message: Union[ConnectFourBoard, Shutdown],
+        worker_id: int,
+        comm: MPI.Comm
+) -> float:
+    result = comm.sendrecv(
+        message,
+        dest=worker_id,
+        sendtag=1,
+        source=worker_id,
+        recvtag=1
+    )
+
+    return result
+
+
+def foo(
+        queue: Queue,
+        worker_id: int,
+        comm: MPI.Comm,
+        executor: ThreadPoolExecutor
+) -> dict[UUID, tuple[Node, Future]]:
+    nodes_waiting = {}
+    if comm.iprobe(worker_id, tag=2):
+        message = comm.recv(source=worker_id, tag=2)
+
+        if isinstance(message, Request) and queue.qsize():
+            to_send = queue.get()
+            nodes_waiting[uuid4()] = (
+                to_send,
+                executor.submit(
+                    calculate_on_worker,
+                    to_send.value,
+                    worker_id,
+                    comm
+                )
+            )
+
+    return nodes_waiting
+
+
+def get_next_move_distributed(root: Node, worker_count: int, comm: MPI.Comm) -> int:
+    nodes = get_all_tree_leafs(root)
+    node_queue = Queue()
+    for node in nodes:
+        node_queue.put(node)
+
+    nodes_waiting: dict[UUID, tuple[Node, Future]] = {}
+    with ThreadPoolExecutor() as executor:
+        while node_queue.qsize():
+            results = executor.map(
+                foo,
+                [node_queue] * worker_count,
+                range(1, worker_count + 1),
+                [comm] * worker_count,
+                [executor] * worker_count
+            )
+            for i in results:
+                nodes_waiting.update(i)
+
+        for worker_id in range(1, worker_count + 1):
+            executor.submit(
+                comm.send,
+                Shutdown(),
+                worker_id,
+                1
+            )
+
+    for i in nodes_waiting:
+        nodes_waiting[i][0].value.weight = nodes_waiting[i][1].result()
+
+    root = calculate_tree_weight2(root)
+
+    return get_next_move(list(i.value.weight for i in root.children))
+
+
+def main() -> None:
+    comm = MPI.COMM_WORLD
+    mpi_id = comm.Get_rank()
+    cluster_size = comm.Get_size()
+
+    args = sys.argv
+
+    next_move = 3
+    if len(args) > 1:
+        next_move = int(args[1])
+
+    if cluster_size == 1:
+        board = create_board()
+        board = board.drop_token(next_move, TokenEnum.RED)
+
+        root = Node(board)
+        root = build_tree(root, 7)
+        root = calculate_tree_weight(root)
+
+        next_move = get_next_move(list(i.value.weight for i in root.children))
+
+        board = board.drop_token(next_move, TokenEnum.YELLOW)
+
+        print(board)
+        print(board.who_won())
+    else:
+        if mpi_id == 0:
+            board = create_board()
+            board = board.drop_token(next_move, TokenEnum.RED)
+
+            root = Node(board)
+            root = build_tree(root, 2)
+
+            next_move = get_next_move_distributed(root, cluster_size - 1, comm)
+
+            board = board.drop_token(next_move, TokenEnum.YELLOW)
+            print(board)
+            print(board.who_won())
+        else:
+            while True:
+                message = comm.sendrecv(Request(), source=0, dest=0, sendtag=2, recvtag=1)
+
+                if isinstance(message, Shutdown):
+                    return
+
+                root = Node(message)
+                root = build_tree(root, 5)
+                root = calculate_tree_weight(root)
+
+                weight = root.value.weight
+
+                comm.send(weight, 0, tag=1)
+
+
+if __name__ == '__main__':
+    main()
