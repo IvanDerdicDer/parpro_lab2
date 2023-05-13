@@ -1,6 +1,5 @@
-import math
+import pickle
 from dataclasses import dataclass, field
-from functools import reduce
 from typing import Optional, Generator, Union
 from enum import Enum
 from copy import deepcopy
@@ -10,6 +9,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, Future
 from uuid import uuid4, UUID
 from queue import Queue
+import os
 
 
 class TokenEnum(Enum):
@@ -249,14 +249,18 @@ def print_tree(root: Node) -> None:
 
 
 def create_board() -> ConnectFourBoard:
+    if os.path.exists("board.pickle"):
+        with open("board.pickle", "rb") as f:
+            return pickle.load(f)
+
     board = ConnectFourBoard(7, 6)
 
-    board = board.drop_token(0, TokenEnum.RED)
-    board = board.drop_token(1, TokenEnum.YELLOW)
-    board = board.drop_token(1, TokenEnum.RED)
-    board = board.drop_token(2, TokenEnum.YELLOW)
-    board = board.drop_token(2, TokenEnum.RED)
-    board = board.drop_token(3, TokenEnum.YELLOW)
+    # board = board.drop_token(0, TokenEnum.RED)
+    # board = board.drop_token(1, TokenEnum.YELLOW)
+    # board = board.drop_token(1, TokenEnum.RED)
+    # board = board.drop_token(2, TokenEnum.YELLOW)
+    # board = board.drop_token(2, TokenEnum.RED)
+    # board = board.drop_token(3, TokenEnum.YELLOW)
 
     return board
 
@@ -343,6 +347,14 @@ def get_next_move_distributed(root: Node, worker_count: int, comm: MPI.Comm) -> 
     return get_next_move(list(i.value.weight for i in root.children))
 
 
+def shutdown_all_workers(
+        comm: MPI.Comm,
+        worker_count: int
+) -> None:
+    for worker_id in range(1, worker_count + 1):
+        comm.send(Shutdown(), worker_id, 1)
+
+
 def main() -> None:
     comm = MPI.COMM_WORLD
     mpi_id = comm.Get_rank()
@@ -357,6 +369,11 @@ def main() -> None:
     if cluster_size == 1:
         board = create_board()
         board = board.drop_token(next_move, TokenEnum.RED)
+        if board.is_last_move_winning():
+            print(board)
+            print(board.who_won())
+            shutdown_all_workers(comm, cluster_size - 1)
+            return
 
         root = Node(board)
         root = build_tree(root, 7)
@@ -366,12 +383,20 @@ def main() -> None:
 
         board = board.drop_token(next_move, TokenEnum.YELLOW)
 
+        with open("board.pickle", "wb") as f:
+            pickle.dump(board, f)
+
         print(board)
         print(board.who_won())
     else:
         if mpi_id == 0:
             board = create_board()
             board = board.drop_token(next_move, TokenEnum.RED)
+            if board.is_last_move_winning():
+                print(board)
+                print(board.who_won())
+                shutdown_all_workers(comm, cluster_size - 1)
+                return
 
             root = Node(board)
             root = build_tree(root, 2)
@@ -379,6 +404,10 @@ def main() -> None:
             next_move = get_next_move_distributed(root, cluster_size - 1, comm)
 
             board = board.drop_token(next_move, TokenEnum.YELLOW)
+
+            with open("board.pickle", "wb") as f:
+                pickle.dump(board, f)
+
             print(board)
             print(board.who_won())
         else:
