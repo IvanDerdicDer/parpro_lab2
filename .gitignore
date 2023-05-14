@@ -1,2 +1,4 @@
 venv
 .idea
+board.pickle
+connect_four.zip
